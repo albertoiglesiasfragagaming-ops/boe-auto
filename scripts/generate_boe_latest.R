@@ -1,107 +1,98 @@
 #!/usr/bin/env Rscript
 
-library(lubridate)
-library(jsonlite)
+# Load required libraries
 library(BOE)
+library(jsonlite)
+library(lubridate)
 
-# Forzar timezone Europe/Madrid
+# Set timezone to Europe/Madrid
+Sys.setenv(TZ = "Europe/Madrid")
+
+# Get current time in Madrid timezone
 now_madrid <- with_tz(Sys.time(), "Europe/Madrid")
 hour_madrid <- hour(now_madrid)
+date_madrid <- as.Date(now_madrid)
 
-# Salir sin cambios si no es 10, 15 o 20 en Madrid
+# Check if current hour is 10, 15, or 20 in Madrid time
 if (!(hour_madrid %in% c(10, 15, 20))) {
-  cat(sprintf("Current hour in Madrid: %02d. Exiting without changes.\n", hour_madrid))
+  message(sprintf("Current hour in Madrid: %d. Not an execution hour (10, 15, 20). Exiting without changes.", hour_madrid))
   quit(status = 0)
 }
 
-cat(sprintf("Starting BOE Sumario download at %s (Madrid time)\n", 
-            format(now_madrid, "%Y-%m-%d %H:%M:%S %Z")))
+message(sprintf("Executing BOE sumario download at %s Madrid time", format(now_madrid, "%Y-%m-%d %H:%M:%S")))
 
-# Crear directorio si no existe
+# Create output directory if it doesn't exist
 dir.create("docs/boe", showWarnings = FALSE, recursive = TRUE)
 
-# Timestamp para archivo histórico
-timestamp_str <- format(now_madrid, "%Y-%m-%dT%H-%M-%S")
-run_file <- sprintf("docs/boe/run_%s.json", timestamp_str)
+# Timestamp for run file
+timestamp_iso <- format(now_madrid, "%Y-%m-%dT%H-%M-%S")
+run_file <- sprintf("docs/boe/run_%s.json", timestamp_iso)
 
-# Recuperar sumario
-result <- tryCatch(
+# Initialize result structure
+result <- list(
+  meta = list(
+    date = format(date_madrid, "%Y-%m-%d"),
+    fetched_at_madrid = format(now_madrid, "%Y-%m-%d %H:%M:%S %Z")
+  ),
+  status = "ok",
+  error = NULL,
+  items = list()
+)
+
+# Try to retrieve BOE sumario
+tryCatch(
   {
-    date_today <- as.Date(now_madrid)
-    cat(sprintf("Retrieving sumario for date: %s\n", date_today))
+    message(sprintf("Retrieving BOE sumario for %s", format(date_madrid, "%Y-%m-%d")))
     
-    sumario <- BOE::retrieve_sumario(date_today)
+    # Call retrieve_sumario from BOE package
+    sumario_data <- BOE::retrieve_sumario(date_madrid)
     
-    if (is.null(sumario) || nrow(sumario) == 0) {
-      list(
-        meta = list(
-          date = as.character(date_today),
-          fetched_at_madrid = format(now_madrid, "%Y-%m-%d %H:%M:%S %Z")
-        ),
-        status = "no_items",
-        error = NULL,
-        items = list()
-      )
+    # Check if we got data
+    if (is.null(sumario_data) || nrow(sumario_data) == 0) {
+      result$status <- "no_items"
+      message("No BOE items found for this date")
     } else {
-      # Deduplicación: primero por publication, luego por text+pages
-      sumario_dedup <- sumario
+      message(sprintf("Retrieved %d items from BOE", nrow(sumario_data)))
       
-      if ("publication" %in% names(sumario_dedup)) {
-        sumario_dedup <- sumario_dedup[!duplicated(sumario_dedup$publication, fromLast = TRUE), ]
+      # Deduplication: remove duplicates by publication, or by (text + pages) if no publication
+      if ("publication" %in% names(sumario_data)) {
+        sumario_data <- sumario_data[!duplicated(sumario_data$publication, fromLast = TRUE), ]
+      } else if ("text" %in% names(sumario_data) && "pages" %in% names(sumario_data)) {
+        sumario_data <- sumario_data[!duplicated(paste(sumario_data$text, sumario_data$pages), fromLast = TRUE), ]
       }
       
-      if ("text" %in% names(sumario_dedup) && "pages" %in% names(sumario_dedup)) {
-        sumario_dedup <- sumario_dedup[!duplicated(
-          paste0(sumario_dedup$text, "|", sumario_dedup$pages), 
-          fromLast = TRUE
-        ), ]
+      # Sort by section, departament, epigraph for consistency
+      sort_cols <- c()
+      if ("section" %in% names(sumario_data)) sort_cols <- c(sort_cols, "section")
+      if ("departament" %in% names(sumario_data)) sort_cols <- c(sort_cols, "departament")
+      if ("epigraph" %in% names(sumario_data)) sort_cols <- c(sort_cols, "epigraph")
+      
+      if (length(sort_cols) > 0) {
+        sumario_data <- sumario_data[do.call(order, as.list(sumario_data[, sort_cols])), ]
       }
       
-      # Ordenar por section, departament, epigraph
-      if ("section" %in% names(sumario_dedup)) {
-        sumario_dedup <- sumario_dedup[order(
-          sumario_dedup$section,
-          if ("departament" %in% names(sumario_dedup)) sumario_dedup$departament else NA,
-          if ("epigraph" %in% names(sumario_dedup)) sumario_dedup$epigraph else NA
-        ), ]
-      }
-      
-      # Convertir a lista de filas
-      items_list <- lapply(seq_len(nrow(sumario_dedup)), function(i) {
-        as.list(sumario_dedup[i, ])
+      # Convert to list of records
+      result$items <- lapply(1:nrow(sumario_data), function(i) {
+        as.list(sumario_data[i, ])
       })
       
-      list(
-        meta = list(
-          date = as.character(date_today),
-          fetched_at_madrid = format(now_madrid, "%Y-%m-%d %H:%M:%S %Z")
-        ),
-        status = "ok",
-        error = NULL,
-        items = items_list
-      )
+      result$status <- "ok"
+      message(sprintf("Successfully processed %d items", length(result$items)))
     }
   },
   error = function(e) {
-    list(
-      meta = list(
-        date = as.character(as.Date(now_madrid)),
-        fetched_at_madrid = format(now_madrid, "%Y-%m-%d %H:%M:%S %Z")
-      ),
-      status = "error",
-      error = as.character(e),
-      items = list()
-    )
+    result$status <<- "error"
+    result$error <<- as.character(e)
+    message(sprintf("Error retrieving BOE sumario: %s", as.character(e)))
   }
 )
 
-# Guardar latest.json
+# Write latest.json
 write_json(result, "docs/boe/latest.json", auto_unbox = TRUE, pretty = TRUE)
-cat("Updated: docs/boe/latest.json\n")
+message("Written docs/boe/latest.json")
 
-# Guardar run_*.json
+# Write run_TIMESTAMP.json for audit trail
 write_json(result, run_file, auto_unbox = TRUE, pretty = TRUE)
-cat(sprintf("Saved: %s\n", run_file))
+message(sprintf("Written %s", run_file))
 
-cat(sprintf("Result status: %s\n", result$status))
-quit(status = 0)
+message("BOE sumario download completed successfully")
